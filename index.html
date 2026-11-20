@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Bike Vision - surface live</title>
+<!--
+  Step 05g - Surface model live in the browser (phone)
+  The surface model of step 05, exported in step 05d (models/web/), runs on every camera frame.
+  The decision "which surface am I on" is the winner of step 05f:
+    no pixel smoothing needed | the wheel zone (same rule as step 05) | hold: stay on the surface
+    until another one has 70% of the last 1.5 s
+  Sources: the phone camera (back), or a video file (to test on the PC, as if riding).
+  Run on the PC, from the bike folder:   python -m http.server 8000   ->  http://localhost:8000/web/
+  The models are looked for next to this page, then in ../models/web/.
+-->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; font-family: system-ui, sans-serif; overflow: hidden; }
+  #view { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #hud { position: absolute; top: 0; left: 0; right: 0; padding: 10px 12px; background: rgba(0,0,0,.55); }
+  #on { font-size: 34px; font-weight: 700; }
+  #sub { font-size: 13px; color: #ccc; margin-top: 2px; }
+  #bar { position: absolute; bottom: 0; left: 0; right: 0; padding: 10px; display: flex; gap: 8px; flex-wrap: wrap;
+         background: rgba(0,0,0,.6); }
+  button, select, label.btn { background: #222; color: #fff; border: 1px solid #555; border-radius: 8px; padding: 10px 12px;
+         font-size: 15px; }
+  label.btn input { display: none; }
+  #msg { position: absolute; top: 45%; left: 0; right: 0; text-align: center; color: #aaa; padding: 0 20px; }
+  video { display: none; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="hud"><div id="on">on: -</div><div id="sub">load a source below</div></div>
+<div id="msg">Loading the model...</div>
+<div id="bar">
+  <button id="cam">Camera</button>
+  <label class="btn">Video file<input type="file" id="file" accept="video/*"></label>
+  <select id="size"><option value="full">512x896</option><option value="small">288x512</option></select>
+  <select id="look"><option value="output">only my surface</option><option value="all">all surfaces</option></select>
+  <button id="pause">Pause</button>
+</div>
+<video id="video" playsinline muted></video>
+<script>
+"use strict";
+// ---------------- settings (same as steps 05, 05f) ----------------
+const CLASSES = ["other", "bike lane", "road", "sidewalk", "crosswalk", "curb", "marking"];
+const COLOURS = [[0,0,0],[0,200,80],[160,60,160],[230,200,0],[255,255,255],[230,30,30],[255,140,0]];
+const REAL = [1, 2, 3], CROSSWALK = 4, CURB = 5, MARKING = 6;
+const WHEEL = { x0: 0.40, x1: 0.60, y0: 0.88, y1: 1.0 };
+const CROSSING_TOPS = [0.45, 0.3];
+const HOLD_S = 1.5, HOLD_SHARE = 0.7, START_S = 1.0;
+const MODELS = { full: ["surface_512x896.onnx", 512, 896], small: ["surface_288x512.onnx", 288, 512] };
+const MODEL_DIRS = ["./", "../models/web/"];
+ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
+
+const $ = id => document.getElementById(id);
+const view = $("view"), ctx = view.getContext("2d");
+const video = $("video");
+const work = document.createElement("canvas"), wctx = work.getContext("2d", { willReadFrequently: true });
+let session = null, backend = "", size = "full", W = 512, H = 896;
+let running = false, paused = false, busy = false;
+
+// ---------------- model ----------------
+async function loadModel(which) {
+  const [file, w, h] = MODELS[which];
+  $("msg").style.display = "block";
+  $("msg").textContent = "Loading the model...";
+  for (const ep of [["webgpu"], ["wasm"]]) {
+    for (const dir of MODEL_DIRS) {
+      try {
+        session = await ort.InferenceSession.create(dir + file, { executionProviders: ep });
+        backend = ep[0]; size = which; W = w; H = h;
+        work.width = W; work.height = H;
+        $("msg").style.display = "none";
+        $("sub").textContent = `model ${W}x${H} on ${backend}. Choose Camera or Video file.`;
+        return;
+      } catch (e) { console.log(`no ${dir + file} on ${ep[0]}:`, e.message); }
+    }
+  }
+  $("msg").textContent = "Could not load the model (see the browser console).";
+}
+
+// ---------------- which surface is under the wheel (step 05) ----------------
+function onCrosswalk(c) {
+  const y0 = Math.floor(0.6 * H), x0 = Math.floor(WHEEL.x0 * W), x1 = Math.floor(WHEEL.x1 * W);
+  let real = 0, cross = 0, n = 0;
+  for (let y = y0; y < H; y++) for (let x = x0; x < x1; x++) {
+    const v = c[y * W + x]; n++;
+    if (v >= 1 && v <= 3) real++; else if (v === CROSSWALK) cross++;
+  }
+  return real / n < 0.05 && cross / n > 0.3;
+}
+
+function surfaceUnderWheel(c) {
+  const x0 = Math.floor(WHEEL.x0 * W), x1 = Math.floor(WHEEL.x1 * W);
+  const tops = onCrosswalk(c) ? CROSSING_TOPS : [WHEEL.y0, 0.75, 0.6];
+  let kind = -1;
+  for (const top of tops) {
+    const counts = [0, 0, 0, 0];
+    for (let y = Math.floor(top * H); y < H; y++) for (let x = x0; x < x1; x++) {
+      const v = c[y * W + x];
+      if (v >= 1 && v <= 3) counts[v]++;
+    }
+    if (counts[1] + counts[2] + counts[3] > 0) { kind = [1, 2, 3].reduce((a, b) => counts[b] > counts[a] ? b : a); break; }
+  }
+  const mask = new Uint8Array(W * H);
+  if (kind < 0) return { kind: -1, mask };
+  // the region of that surface (paint included) that covers most of the wheel zone
+  const same = i => c[i] === kind || c[i] === CROSSWALK || c[i] === MARKING;
+  const label = new Int32Array(W * H), stack = new Int32Array(W * H);
+  let next = 0, best = 0, bestCount = 0;
+  const yz = Math.floor(WHEEL.y0 * H);
+  for (let y = yz; y < H; y++) for (let x = x0; x < x1; x++) {
+    const s = y * W + x;
+    if (label[s] || !same(s)) continue;
+    next++; let top = 0; stack[top++] = s; label[s] = next; let inZone = 0;
+    while (top) {
+      const i = stack[--top], px = i % W, py = (i - px) / W;
+      if (py >= yz && px >= x0 && px < x1) inZone++;
+      if (px > 0 && !label[i - 1] && same(i - 1)) { label[i - 1] = next; stack[top++] = i - 1; }
+      if (px < W - 1 && !label[i + 1] && same(i + 1)) { label[i + 1] = next; stack[top++] = i + 1; }
+      if (py > 0 && !label[i - W] && same(i - W)) { label[i - W] = next; stack[top++] = i - W; }
+      if (py < H - 1 && !label[i + W] && same(i + W)) { label[i + W] = next; stack[top++] = i + W; }
+    }
+    if (inZone > bestCount) { bestCount = inZone; best = next; }
+  }
+  const counts = [0, 0, 0, 0];
+  for (let i = 0; i < W * H; i++) if (label[i] === best) { mask[i] = 1; if (c[i] >= 1 && c[i] <= 3) counts[c[i]]++; }
+  const total = counts[1] + counts[2] + counts[3];
+  return { kind: total ? [1, 2, 3].reduce((a, b) => counts[b] > counts[a] ? b : a) : -1, mask };
+}
+
+// ---------------- hold: stay on a surface until another clearly wins (step 05f) ----------------
+let recent = [], state = -1, t0 = null;
+function hold(t, kind) {
+  if (t0 === null) t0 = t;
+  recent.push([t, kind]);
+  while (recent.length && recent[0][0] < t - HOLD_S) recent.shift();
+  const counts = [0, 0, 0, 0];
+  for (const [, k] of recent) if (k > 0) counts[k]++;
+  const n = counts[1] + counts[2] + counts[3];
+  if (!n) return state;
+  const best = [1, 2, 3].reduce((a, b) => counts[b] > counts[a] ? b : a);
+  if (state < 0) { if (t - t0 >= START_S) state = best; return state < 0 ? best : state; }
+  if (best !== state && counts[best] >= HOLD_SHARE * n) state = best;
+  return state;
+}
+function resetHold() { recent = []; state = -1; t0 = null; }
+
+// ---------------- one frame ----------------
+function cropToWork(src, sw, sh) {               // centre crop to the model's portrait shape
+  const want = W / H;
+  let cw = sw, ch = sh;
+  if (sw / sh > want) cw = sh * want; else ch = sw / want;
+  wctx.drawImage(src, (sw - cw) / 2, (sh - ch) / 2, cw, ch, 0, 0, W, H);
+}
+
+let fpsCount = 0, fpsT = performance.now(), fps = 0;
+async function step() {
+  if (!running) return;
+  if (paused || busy || video.readyState < 2 || !session) { requestAnimationFrame(step); return; }
+  busy = true;
+  cropToWork(video, video.videoWidth, video.videoHeight);
+  const img = wctx.getImageData(0, 0, W, H).data;
+  const input = new Float32Array(3 * W * H);
+  for (let i = 0, p = 0; i < W * H; i++, p += 4) {
+    input[i] = img[p]; input[i + W * H] = img[p + 1]; input[i + 2 * W * H] = img[p + 2];
+  }
+  const start = performance.now();
+  const out = await session.run({ rgb: new ort.Tensor("float32", input, [1, 3, H, W]) });
+  const ms = performance.now() - start;
+  const c = out.classes.data;
+  const { kind, mask } = surfaceUnderWheel(c);
+  const on = hold(performance.now() / 1000, kind);
+  draw(img, c, mask);
+  fpsCount++;
+  if (performance.now() - fpsT > 1000) { fps = fpsCount * 1000 / (performance.now() - fpsT); fpsCount = 0; fpsT = performance.now(); }
+  $("on").textContent = "on: " + (on > 0 ? CLASSES[on] : "-");
+  $("on").style.color = on > 0 ? `rgb(${COLOURS[on]})` : "#fff";
+  $("sub").textContent = `this frame: ${kind > 0 ? CLASSES[kind] : "none"} | model ${ms.toFixed(0)} ms | ${fps.toFixed(1)} frames/s | ${backend} ${W}x${H}`;
+  busy = false;
+  requestAnimationFrame(step);
+}
+
+function draw(img, c, mask) {
+  const outImg = new ImageData(W, H), o = outImg.data, all = $("look").value === "all";
+  for (let i = 0, p = 0; i < W * H; i++, p += 4) {
+    let r = img[p], g = img[p + 1], b = img[p + 2];
+    if (all) {
+      const col = COLOURS[c[i]];
+      r = 0.45 * r + 0.55 * col[0]; g = 0.45 * g + 0.55 * col[1]; b = 0.45 * b + 0.55 * col[2];
+    } else if (mask[i]) { r = 0.5 * r; g = 0.5 * g + 110; b = 0.5 * b + 127; }   // my surface: cyan
+    else { r *= 0.3; g *= 0.3; b *= 0.3; }                                        // the rest: dimmed
+    o[p] = r; o[p + 1] = g; o[p + 2] = b; o[p + 3] = 255;
+  }
+  if (view.width !== W) { view.width = W; view.height = H; }
+  ctx.putImageData(outImg, 0, 0);
+}
+
+// ---------------- sources ----------------
+let wakeLock = null;
+async function startSource() {
+  resetHold(); running = true; paused = false; $("pause").textContent = "Pause";
+  try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) { }
+  requestAnimationFrame(step);
+}
+$("cam").onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
+    video.srcObject = stream; video.src = ""; await video.play(); startSource();
+  } catch (e) { $("msg").style.display = "block"; $("msg").textContent = "No camera: " + e.message; }
+};
+$("file").onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  if (video.srcObject) { video.srcObject.getTracks().forEach(t => t.stop()); video.srcObject = null; }
+  video.src = URL.createObjectURL(f); video.loop = true; await video.play(); startSource();
+};
+$("pause").onclick = () => {
+  paused = !paused; $("pause").textContent = paused ? "Play" : "Pause";
+  if (!video.srcObject) paused ? video.pause() : video.play();
+};
+$("size").onchange = async e => { running = false; await loadModel(e.target.value); if (video.readyState >= 2) startSource(); };
+loadModel("full");
+</script>
+</body>
+</html>

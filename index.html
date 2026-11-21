@@ -16,7 +16,8 @@
   Battery test (20.11): "rate" = how many frames per second go through the model (max = as many as
   the phone manages). The second line shows, since the source or the rate was chosen: time, the
   share of time spent working (picture prep + model + rule + drawing), and the battery drop.
-  Between runs nothing is done; the screen keeps the last result.
+  Between runs nothing is done; the screen keeps the last result. "off" = camera on, no model: the
+  base cost of screen + camera. The second line keeps counting also when paused or off.
 -->
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.js"></script>
 <style>
@@ -42,7 +43,7 @@
   <button id="cam">Camera</button>
   <label class="btn">Video file<input type="file" id="file" accept="video/*"></label>
   <select id="size"><option value="full">512x896</option><option value="small">288x512</option></select>
-  <select id="rate"><option value="0">max /s</option><option value="15">15 /s</option><option value="5" selected>5 /s</option>
+  <select id="rate"><option value="-1">off (camera only)</option><option value="0">max /s</option><option value="15">15 /s</option><option value="5" selected>5 /s</option>
     <option value="2">2 /s</option><option value="1">1 /s</option></select>
   <select id="look"><option value="output">only my surface</option><option value="all">all surfaces</option></select>
   <button id="pause">Pause</button>
@@ -172,8 +173,9 @@ function meterText() {
     const now = Math.round(100 * battery.level), drop = meter.b0 === null ? 0 : Math.round(100 * (meter.b0 - battery.level));
     bat = battery.charging ? `battery ${now}% (charging, not measured)` : `battery ${now}% (-${drop}%)`;
   }
-  return `rate ${rate ? rate + "/s" : "max"} | ${min} | working ${share}% of the time | ${bat}`;
+  return `rate ${rate < 0 ? "off" : rate ? rate + "/s" : "max"} | ${min} | working ${share}% of the time | ${bat}`;
 }
+setInterval(() => { if (meter && running) $("meter").textContent = meterText(); }, 1000);   // also while paused
 function later(ms) {                              // wait for the next frame (max) or the next due time
   if (!rate) requestAnimationFrame(step); else setTimeout(step, ms ?? 100);
 }
@@ -189,7 +191,7 @@ function cropToWork(src, sw, sh) {               // centre crop to the model's p
 let fpsCount = 0, fpsT = performance.now(), fps = 0;
 async function step() {
   if (!running) return;
-  if (paused || busy || video.readyState < 2 || !session) { later(); return; }
+  if (paused || busy || video.readyState < 2 || !session || rate < 0) { later(); return; }
   const begin = performance.now();
   if (rate && begin < nextDue) { later(nextDue - begin); return; }
   nextDue = begin + (rate ? 1000 / rate : 0);
@@ -259,6 +261,7 @@ $("pause").onclick = () => {
 };
 $("size").onchange = async e => { running = false; await loadModel(e.target.value); if (video.readyState >= 2) startSource(); };
 $("rate").onchange = e => { rate = +e.target.value; if (meter) resetMeter(); };
+setInterval(() => { if (running && meter) $("meter").textContent = meterText(); }, 1000);   // also when paused / off
 loadModel("full");
 </script>
 </body>

@@ -13,6 +13,10 @@
   Sources: the phone camera (back), or a video file (to test on the PC, as if riding).
   Run on the PC, from the bike folder:   python -m http.server 8000   ->  http://localhost:8000/web/
   The models are looked for next to this page, then in ../models/web/.
+  Battery test (20.11): "rate" = how many frames per second go through the model (max = as many as
+  the phone manages). The second line shows, since the source or the rate was chosen: time, the
+  share of time spent working (picture prep + model + rule + drawing), and the battery drop.
+  Between runs nothing is done; the screen keeps the last result.
 -->
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.js"></script>
 <style>
@@ -20,7 +24,7 @@
   #view { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
   #hud { position: absolute; top: 0; left: 0; right: 0; padding: 10px 12px; background: rgba(0,0,0,.55); }
   #on { font-size: 34px; font-weight: 700; }
-  #sub { font-size: 13px; color: #ccc; margin-top: 2px; }
+  #sub, #meter { font-size: 13px; color: #ccc; margin-top: 2px; }
   #bar { position: absolute; bottom: 0; left: 0; right: 0; padding: 10px; display: flex; gap: 8px; flex-wrap: wrap;
          background: rgba(0,0,0,.6); }
   button, select, label.btn { background: #222; color: #fff; border: 1px solid #555; border-radius: 8px; padding: 10px 12px;
@@ -32,12 +36,14 @@
 </head>
 <body>
 <canvas id="view"></canvas>
-<div id="hud"><div id="on">on: -</div><div id="sub">load a source below</div></div>
+<div id="hud"><div id="on">on: -</div><div id="sub">load a source below</div><div id="meter"></div></div>
 <div id="msg">Loading the model...</div>
 <div id="bar">
   <button id="cam">Camera</button>
   <label class="btn">Video file<input type="file" id="file" accept="video/*"></label>
   <select id="size"><option value="full">512x896</option><option value="small">288x512</option></select>
+  <select id="rate"><option value="0">max /s</option><option value="15">15 /s</option><option value="5" selected>5 /s</option>
+    <option value="2">2 /s</option><option value="1">1 /s</option></select>
   <select id="look"><option value="output">only my surface</option><option value="all">all surfaces</option></select>
   <button id="pause">Pause</button>
 </div>
@@ -149,6 +155,29 @@ function hold(t, kind) {
 }
 function resetHold() { recent = []; state = -1; t0 = null; }
 
+// ---------------- rate and battery meter (battery test, 20.11) ----------------
+let rate = +$("rate").value, nextDue = 0;
+let battery = null, meter = null;
+navigator.getBattery?.().then(b => { battery = b; if (meter) meter.b0 = b.level; }).catch(() => { });
+function resetMeter() {
+  meter = { t0: performance.now(), runs: 0, workMs: 0, b0: battery ? battery.level : null };
+  nextDue = 0;
+}
+function meterText() {
+  const s = (performance.now() - meter.t0) / 1000;
+  const min = `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")} min`;
+  const share = (100 * meter.workMs / (s * 1000)).toFixed(0);
+  let bat = "battery: not available here";
+  if (battery) {
+    const now = Math.round(100 * battery.level), drop = meter.b0 === null ? 0 : Math.round(100 * (meter.b0 - battery.level));
+    bat = battery.charging ? `battery ${now}% (charging, not measured)` : `battery ${now}% (-${drop}%)`;
+  }
+  return `rate ${rate ? rate + "/s" : "max"} | ${min} | working ${share}% of the time | ${bat}`;
+}
+function later(ms) {                              // wait for the next frame (max) or the next due time
+  if (!rate) requestAnimationFrame(step); else setTimeout(step, ms ?? 100);
+}
+
 // ---------------- one frame ----------------
 function cropToWork(src, sw, sh) {               // centre crop to the model's portrait shape
   const want = W / H;
@@ -160,7 +189,10 @@ function cropToWork(src, sw, sh) {               // centre crop to the model's p
 let fpsCount = 0, fpsT = performance.now(), fps = 0;
 async function step() {
   if (!running) return;
-  if (paused || busy || video.readyState < 2 || !session) { requestAnimationFrame(step); return; }
+  if (paused || busy || video.readyState < 2 || !session) { later(); return; }
+  const begin = performance.now();
+  if (rate && begin < nextDue) { later(nextDue - begin); return; }
+  nextDue = begin + (rate ? 1000 / rate : 0);
   busy = true;
   cropToWork(video, video.videoWidth, video.videoHeight);
   const img = wctx.getImageData(0, 0, W, H).data;
@@ -175,13 +207,16 @@ async function step() {
   const { kind, mask } = surfaceUnderWheel(c);
   const on = hold(performance.now() / 1000, kind);
   draw(img, c, mask);
+  const allMs = performance.now() - begin;
+  meter.runs++; meter.workMs += allMs;
   fpsCount++;
   if (performance.now() - fpsT > 1000) { fps = fpsCount * 1000 / (performance.now() - fpsT); fpsCount = 0; fpsT = performance.now(); }
   $("on").textContent = "on: " + (on > 0 ? CLASSES[on] : "-");
   $("on").style.color = on > 0 ? `rgb(${COLOURS[on]})` : "#fff";
-  $("sub").textContent = `this frame: ${kind > 0 ? CLASSES[kind] : "none"} | model ${ms.toFixed(0)} ms | ${fps.toFixed(1)} frames/s | ${backend} ${W}x${H}`;
+  $("sub").textContent = `this frame: ${kind > 0 ? CLASSES[kind] : "none"} | model ${ms.toFixed(0)} ms, all ${allMs.toFixed(0)} ms | ${fps.toFixed(1)} frames/s | ${backend} ${W}x${H}`;
+  $("meter").textContent = meterText();
   busy = false;
-  requestAnimationFrame(step);
+  later(nextDue - performance.now());
 }
 
 function draw(img, c, mask) {
@@ -202,7 +237,7 @@ function draw(img, c, mask) {
 // ---------------- sources ----------------
 let wakeLock = null;
 async function startSource() {
-  resetHold(); running = true; paused = false; $("pause").textContent = "Pause";
+  resetHold(); resetMeter(); running = true; paused = false; $("pause").textContent = "Pause";
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) { }
   requestAnimationFrame(step);
 }
@@ -223,6 +258,7 @@ $("pause").onclick = () => {
   if (!video.srcObject) paused ? video.pause() : video.play();
 };
 $("size").onchange = async e => { running = false; await loadModel(e.target.value); if (video.readyState >= 2) startSource(); };
+$("rate").onchange = e => { rate = +e.target.value; if (meter) resetMeter(); };
 loadModel("full");
 </script>
 </body>
